@@ -1,6 +1,6 @@
 {
   "bf16": {
-    "enabled": true
+    "enabled": false
   },
   "fp16": {
     "enabled": false

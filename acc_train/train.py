@@ -18,6 +18,7 @@ from acc_train.modeling import (
     load_causal_lm,
     save_router_gates,
 )
+from acc_train.precision import configure_native_fp8_precision, print_precision_plan
 
 
 class ACCBucketTrainer(Trainer):
@@ -202,7 +203,9 @@ def validate_training_config(config: dict[str, Any], model) -> None:
 def main() -> None:
     args = parse_args()
     config = apply_cli_overrides(load_yaml_config(args.config), args.override)
+    precision_plan = configure_native_fp8_precision(config)
     set_seed(int(config.get("seed", 42)))
+    print_precision_plan(precision_plan)
 
     tokenizer = AutoTokenizer.from_pretrained(
         config["model"]["name_or_path"],
@@ -246,7 +249,9 @@ def main() -> None:
         adam_beta2=float(training_cfg.get("adam_beta2", 0.999)),
         weight_decay=float(training_cfg.get("weight_decay", 0.1)),
         max_grad_norm=float(training_cfg.get("max_grad_norm", 1.0)),
-        bf16=bool(training_cfg.get("bf16", True)),
+        bf16=precision_plan.bf16,
+        fp16=precision_plan.fp16,
+        tf32=precision_plan.tf32,
         run_name=training_cfg.get("run_name"),
         logging_dir=training_cfg.get("logging_dir"),
         logging_steps=int(training_cfg.get("logging_steps", 1)),

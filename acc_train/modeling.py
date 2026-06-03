@@ -84,7 +84,7 @@ def load_causal_lm(config: dict[str, Any]):
     model_cfg = config["model"]
     model_name = model_cfg["name_or_path"]
     assert_supported_model_choice(model_name, bool(model_cfg.get("allow_unsupported_fp8", False)))
-    dtype = torch_dtype_from_name(model_cfg.get("torch_dtype", "bfloat16"))
+    dtype = torch_dtype_from_name(model_cfg.get("torch_dtype", "auto"))
     hf_deepspeed_config = build_hf_deepspeed_config(config)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -122,11 +122,12 @@ def apply_lora_and_router_policy(model, config: dict[str, Any]):
     router_cfg = config.get("router", {})
     if router_cfg.get("train_router_gates", True):
         pattern = re.compile(str(router_cfg.get("name_regex", r"model\.layers\.\d+\.mlp\.gate")))
-        router_dtype = torch_dtype_from_name(router_cfg.get("dtype", "bfloat16"))
+        router_dtype = torch_dtype_from_name(router_cfg.get("dtype", "auto"))
         marked = 0
         for name, module in model.named_modules():
             if pattern.search(name):
-                module.to(dtype=router_dtype)
+                if router_dtype != "auto":
+                    module.to(dtype=router_dtype)
                 for param in module.parameters(recurse=False):
                     param.requires_grad = True
                     marked += param.numel()

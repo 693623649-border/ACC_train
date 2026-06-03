@@ -1,15 +1,32 @@
-project_name: acc-qwen3-h20-fp8-sp2
+project_name: acc-qwen3-h20-native-fp8-sp2
 seed: 42
 
 model:
   name_or_path: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
-  precision_mode: fp8_frozen_backbone_bf16_lora_router
+  precision_mode: native_fp8_transformer_engine
   torch_dtype: auto
   attn_implementation: flash_attention_2
   trust_remote_code: false
   use_cache: false
   gradient_checkpointing: true
   allow_unsupported_fp8: false
+
+precision:
+  mode: native_fp8_transformer_engine
+  mixed_precision: fp8
+  fp8_backend: TE
+  fp8_format: HYBRID
+  amax_history_len: 1024
+  amax_compute_algo: max
+  margin: 0
+  interval: 1
+  override_linear_precision:
+    - false
+    - false
+    - false
+  use_autocast_during_eval: false
+  require_transformer_engine: true
+  trainable_parameter_dtype: auto
 
 data:
   manifest_path: manifests/ACC_subset_4500_manifest.json
@@ -41,8 +58,8 @@ parallelism:
   sp_attn_implementation: flash_attention_2
 
 training:
-  output_dir: outputs/acc_qwen3_h20_fp8_sp2
-  deepspeed_config: configs/deepspeed_zero3_sp2.json
+  output_dir: outputs/acc_qwen3_h20_native_fp8_sp2
+  deepspeed_config: configs/deepspeed_zero3_fp8_sp2.json
   num_train_epochs: 1
   max_steps: -1
   per_device_train_batch_size: 1
@@ -58,12 +75,15 @@ training:
   weight_decay: 0.1
   max_grad_norm: 1.0
   cross_entropy_chunk_size: 1024
-  run_name: acc-qwen3-h20-fp8-sp2
-  logging_dir: outputs/acc_qwen3_h20_fp8_sp2/logs
+  run_name: acc-qwen3-h20-native-fp8-sp2
+  logging_dir: outputs/acc_qwen3_h20_native_fp8_sp2/logs
   logging_steps: 1
   save_steps: 50
   save_total_limit: 3
-  bf16: true
+  mixed_precision: fp8
+  bf16: false
+  fp16: false
+  tf32: false
   dataloader_num_workers: 2
   remove_unused_columns: false
   report_to: wandb
@@ -83,7 +103,7 @@ lora:
 router:
   train_router_gates: true
   name_regex: 'model\.layers\.\d+\.mlp\.gate'
-  dtype: bfloat16
+  dtype: auto
 
 assets:
   non_weight_dir: model_assets/Qwen3-30B-A3B-Thinking-2507-FP8-nonweights

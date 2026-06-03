@@ -4,8 +4,9 @@
 
 ```text
 Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
-+ FP8 frozen backbone
-+ BF16 LoRA/router
++ Native FP8 compute through Accelerate + Transformer Engine
++ frozen FP8 checkpoint backbone
++ LoRA/router trainable parameters without BF16 training switches
 + DeepSpeed-Ulysses SP2
 + max_seq_length 131072
 ```
@@ -41,9 +42,9 @@ wandb login
 export WANDB_MODE=offline
 ```
 
-## 2. 检查 H20 FP8 支持
+## 2. 检查 H20 原生 FP8 支持
 
-Qwen 官方 FP8 checkpoint 要求 GPU compute capability 大于 8.9。H20 属于 Hopper 路线，预期应支持 FP8。
+Qwen 官方 FP8 checkpoint 要求 GPU compute capability 大于 8.9。当前训练路径还要求 NVIDIA Transformer Engine，因为本仓库使用 Accelerate `mixed_precision=fp8` + TE backend，而不是 BF16 autocast。
 
 ```bash
 python scripts/check_qwen_fp8_runtime.py
@@ -52,8 +53,12 @@ python scripts/check_qwen_fp8_runtime.py
 期望所有可见 GPU 输出：
 
 ```text
+required_mixed_precision=fp8
+required_fp8_backend=te
+transformer_engine_available=true
 qwen_fp8_runtime_supported=true
 all_visible_gpus_qwen_fp8_supported=true
+native_fp8_training_ready=true
 ```
 
 ## 3. 下载模型非权重资产
@@ -128,14 +133,20 @@ data/tokenized_acc_4500_qwen3_fp8_128k/rejected.jsonl
 
 ```text
 configs/acc_qwen3_h20_fp8_sp2.yaml
-configs/deepspeed_zero3_sp2.json
+configs/deepspeed_zero3_fp8_sp2.json
+configs/accelerate_h20_fp8_te.yaml
 ```
 
 关键参数：
 
 ```text
 model: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
-precision_mode: fp8_frozen_backbone_bf16_lora_router
+precision_mode: native_fp8_transformer_engine
+mixed_precision: fp8
+fp8_backend: TE
+fp8_format: HYBRID
+TrainingArguments bf16/fp16: false/false
+DeepSpeed bf16/fp16: false/false
 max_seq_length: 131072
 num_train_epochs: 1
 global_batch_size: 16
@@ -148,9 +159,9 @@ min_learning_rate: 1e-6
 warmup_ratio: 0.05
 cross_entropy_chunk_size: 1024
 LoRA: r=8, alpha=16, dropout=0.05, q/k/v/o
-router: model.layers.*.mlp.gate BF16 trainable
+router: model.layers.*.mlp.gate trainable, dtype=auto
 report_to: wandb
-run_name: acc-qwen3-h20-fp8-sp2
+run_name: acc-qwen3-h20-native-fp8-sp2
 ```
 
 ## 7. Smoke Test
@@ -180,20 +191,20 @@ bash scripts/launch_train_h20_fp8_sp2.sh \
 ```bash
 bash scripts/launch_train_h20_fp8_sp2.sh \
   --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_fp8_128k \
-  --override training.output_dir=outputs/acc_qwen3_h20_fp8_sp2
+  --override training.output_dir=outputs/acc_qwen3_h20_native_fp8_sp2
 ```
 
 恢复训练：
 
 ```bash
 bash scripts/launch_train_h20_fp8_sp2.sh \
-  --resume-from-checkpoint outputs/acc_qwen3_h20_fp8_sp2/checkpoint-50
+  --resume-from-checkpoint outputs/acc_qwen3_h20_native_fp8_sp2/checkpoint-50
 ```
 
 输出：
 
 ```text
-outputs/acc_qwen3_h20_fp8_sp2/
+outputs/acc_qwen3_h20_native_fp8_sp2/
   adapter_config.json
   adapter_model.safetensors
   router_gates.safetensors
@@ -204,14 +215,17 @@ outputs/acc_qwen3_h20_fp8_sp2/
 
 ## 9. 实现要点
 
+- `acc_train/precision.py` 是精度实现模块：强制 `mixed_precision=fp8`、`fp8_backend=TE`，并拒绝 `bf16=true/fp16=true`。
+- `scripts/launch_train_h20_fp8_sp2.sh` 使用 `accelerate launch --mixed_precision fp8 --fp8_backend te`，不再使用 `--mixed_precision bf16`。
+- `configs/deepspeed_zero3_fp8_sp2.json` 显式关闭 DeepSpeed `bf16` 和 `fp16`，ZeRO-3 只负责分片和优化器状态管理。
 - FP8 checkpoint 会检查所有可见 GPU 的 compute capability，非 FP8-capable GPU 会直接报错。
-- backbone 显式冻结，只开启 LoRA 和 router gate。
+- backbone 显式冻结，只开启 LoRA 和 router gate；trainable 参数 dtype 默认为 `auto`，不再强制 cast 到 BF16。
 - loss 使用 chunked CE，按 1024 token 分块过 `lm_head`，避免 131K full logits OOM。
 - ZeRO-3 下 router gate 保存只在 main process 执行，并在保存前 gather 分片参数。
 - DeepSpeed-Ulysses SP2 负责长序列 attention 并行。
 
 ## 10. 已知服务器验证风险
 
-- FP8 checkpoint + PEFT LoRA 对 quantized Linear 的兼容性必须通过 smoke test 验证。
+- FP8 checkpoint + PEFT LoRA + Transformer Engine 对 Qwen3Moe quantized/linear modules 的兼容性必须通过 smoke test 验证。
 - DeepSpeed-Ulysses 与 Qwen3Moe 的版本组合依赖较新 `transformers/accelerate/deepspeed`。
 - 本地静态测试不能替代 H20 上的 8K 和 128K smoke test。
