@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 from acc_train.config import load_yaml_config, parse_override, set_by_dotted_key
@@ -34,6 +35,7 @@ class ACCBucketTrainer(Trainer):
         self.bucket_seed = seed
         self.min_learning_rate = min_learning_rate
         self.base_learning_rate = base_learning_rate
+        self.cross_entropy_chunk_size = int(getattr(self.args, "cross_entropy_chunk_size", 0) or 0)
 
     def _get_train_sampler(self):
         if self.train_dataset is None:
@@ -69,6 +71,71 @@ class ACCBucketTrainer(Trainer):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         return self.lr_scheduler
 
+    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch=None):
+        chunk_size = int(getattr(self, "cross_entropy_chunk_size", 0) or 0)
+        if chunk_size <= 0:
+            try:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            except TypeError:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+        labels = inputs["labels"]
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask")
+        position_ids = inputs.get("position_ids")
+        causal_lm = unwrap_causal_lm(model)
+        transformer = getattr(causal_lm, "model", None)
+        lm_head = getattr(causal_lm, "lm_head", None)
+        if transformer is None or lm_head is None:
+            raise RuntimeError("Chunked CE requires a CausalLM with `.model` and `.lm_head` attributes.")
+
+        outputs = transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        shift_hidden = hidden_states[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        total_loss = shift_hidden.new_zeros(())
+        total_tokens = shift_labels.ne(-100).sum().clamp_min(1)
+        seq_len = shift_hidden.shape[1]
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            chunk_labels = shift_labels[:, start:end]
+            if not chunk_labels.ne(-100).any():
+                continue
+            chunk_logits = lm_head(shift_hidden[:, start:end, :])
+            total_loss = total_loss + F.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.size(-1)),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+        loss = total_loss / total_tokens
+        if return_outputs:
+            return loss, {"loss": loss}
+        return loss
+
+
+def unwrap_causal_lm(model):
+    current = model
+    while hasattr(current, "module"):
+        current = current.module
+    if hasattr(current, "get_base_model"):
+        current = current.get_base_model()
+    while hasattr(current, "module"):
+        current = current.module
+    return current
+
 
 def build_parallelism_config(config: dict[str, Any]):
     parallelism = config.get("parallelism", {})
@@ -95,7 +162,7 @@ def build_parallelism_config(config: dict[str, Any]):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Qwen3 MoE on ACC 4500 with SP2 long-context SFT.")
-    parser.add_argument("--config", default="configs/acc_qwen3_a800_sp2.yaml")
+    parser.add_argument("--config", default="configs/acc_qwen3_h20_fp8_sp2.yaml")
     parser.add_argument("--override", action="append", default=[], help="Dotted YAML override, e.g. training.max_steps=2")
     parser.add_argument("--resume-from-checkpoint", default=None)
     return parser.parse_args()
@@ -191,6 +258,7 @@ def main() -> None:
         deepspeed=training_cfg.get("deepspeed_config"),
         parallelism_config=parallelism_config,
     )
+    setattr(training_args, "cross_entropy_chunk_size", int(training_cfg.get("cross_entropy_chunk_size", 0)))
 
     trainer = ACCBucketTrainer(
         model=model,
@@ -206,12 +274,14 @@ def main() -> None:
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(training_cfg["output_dir"])
-    tokenizer.save_pretrained(training_cfg["output_dir"])
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(training_cfg["output_dir"])
     router_path = save_router_gates(model, training_cfg["output_dir"])
 
-    with Path(training_cfg["output_dir"], "acc_training_config.json").open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, ensure_ascii=False, indent=2)
-    print(f"router_gates={router_path}")
+    if trainer.is_world_process_zero():
+        with Path(training_cfg["output_dir"], "acc_training_config.json").open("w", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
+        print(f"router_gates={router_path}")
 
 
 if __name__ == "__main__":

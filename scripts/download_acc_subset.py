@@ -11,7 +11,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download ACC subset lines according to a fixed manifest.")
-    parser.add_argument("--manifest", default="paper/ACC_subset_4500_manifest.json")
+    parser.add_argument("--manifest", default="manifests/ACC_subset_4500_manifest.json")
     parser.add_argument("--output-dir", default="data/acc_subset_4500")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
