@@ -220,7 +220,10 @@ outputs/acc_qwen3_h20_native_fp8_sp2/
 - `configs/deepspeed_zero3_fp8_sp2.json` 显式关闭 DeepSpeed `bf16` 和 `fp16`，ZeRO-3 只负责分片和优化器状态管理。
 - FP8 checkpoint 会检查所有可见 GPU 的 compute capability，非 FP8-capable GPU 会直接报错。
 - backbone 显式冻结，只开启 LoRA 和 router gate；trainable 参数 dtype 默认为 `auto`，不再强制 cast 到 BF16。
-- loss 使用 chunked CE，按 1024 token 分块过 `lm_head`，避免 131K full logits OOM。
+- loss 使用 SP-aware chunked CE：优先消费 Ulysses 注入的 `shift_labels`，避免 shard 内自行 shift 丢失边界 token。
+- 每个 CE chunk 通过 checkpoint 重算 `lm_head`，避免 autograd 为所有 chunk 保留 logits 激活。
+- 全 -100 label chunk 也会执行 dummy `lm_head`，并把 chunk 次数跨 rank 对齐，降低 ZeRO-3 参数 gather 死锁风险。
+- 跨 SP rank 的 loss 按有效 label token 加权聚合，适配 ACC/SFT 中 prompt token 被标记为 `-100` 的不均匀分布。
 - ZeRO-3 下 router gate 保存只在 main process 执行，并在保存前 gather 分片参数。
 - DeepSpeed-Ulysses SP2 负责长序列 attention 并行。
 

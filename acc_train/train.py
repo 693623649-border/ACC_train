@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 from acc_train.config import load_yaml_config, parse_override, set_by_dotted_key
@@ -86,6 +89,7 @@ class ACCBucketTrainer(Trainer):
                 return super().compute_loss(model, inputs, return_outputs=return_outputs)
 
         labels = inputs["labels"]
+        shift_labels = inputs.get("shift_labels")
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
         position_ids = inputs.get("position_ids")
@@ -103,28 +107,51 @@ class ACCBucketTrainer(Trainer):
             return_dict=True,
         )
         hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
-        shift_hidden = hidden_states[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        if shift_labels is None:
+            shift_hidden = hidden_states[:, :-1, :]
+            shift_labels = labels[:, 1:]
+        else:
+            shift_hidden = hidden_states
+        shift_hidden = shift_hidden.contiguous()
+        shift_labels = shift_labels.contiguous()
 
         total_loss = shift_hidden.new_zeros(())
-        total_tokens = shift_labels.ne(-100).sum().clamp_min(1)
+        total_tokens = shift_labels.ne(-100).sum()
         seq_len = shift_hidden.shape[1]
-        for start in range(0, seq_len, chunk_size):
+        num_chunks = max(math.ceil(seq_len / chunk_size), 1)
+        num_chunks = max(num_chunks, distributed_max_int(num_chunks))
+        for chunk_index in range(num_chunks):
+            start = chunk_index * chunk_size
             end = min(start + chunk_size, seq_len)
-            chunk_labels = shift_labels[:, start:end]
-            if not chunk_labels.ne(-100).any():
-                continue
-            chunk_logits = lm_head(shift_hidden[:, start:end, :])
-            total_loss = total_loss + F.cross_entropy(
-                chunk_logits.reshape(-1, chunk_logits.size(-1)),
-                chunk_labels.reshape(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-        loss = total_loss / total_tokens
+            if start < seq_len:
+                chunk_hidden = shift_hidden[:, start:end, :]
+                chunk_labels = shift_labels[:, start:end]
+            else:
+                chunk_hidden = shift_hidden[:, :1, :] * 0
+                chunk_labels = shift_labels.new_full((shift_labels.shape[0], 1), -100)
+            loss_fn = lambda hidden, labels: chunked_lm_head_ce_sum(hidden, labels, lm_head)
+            total_loss = total_loss + checkpoint(loss_fn, chunk_hidden, chunk_labels, use_reentrant=False)
+        loss = normalize_sequence_parallel_loss(total_loss, total_tokens, self.sequence_parallel_group())
         if return_outputs:
             return loss, {"loss": loss}
         return loss
+
+    def sequence_parallel_group(self):
+        accelerator = getattr(self, "accelerator", None)
+        mesh = getattr(accelerator, "torch_device_mesh", None)
+        if mesh is not None:
+            try:
+                return mesh["sp"].get_group()
+            except Exception:
+                pass
+        try:
+            from deepspeed.utils import groups
+        except Exception:
+            return None
+        try:
+            return groups._get_sequence_parallel_group()
+        except Exception:
+            return None
 
 
 def unwrap_causal_lm(model):
@@ -136,6 +163,49 @@ def unwrap_causal_lm(model):
     while hasattr(current, "module"):
         current = current.module
     return current
+
+
+def chunked_lm_head_ce_sum(hidden_states: torch.Tensor, labels: torch.Tensor, lm_head) -> torch.Tensor:
+    logits = lm_head(hidden_states)
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+
+
+def distributed_max_int(value: int) -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return int(value)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    tensor = torch.tensor(int(value), device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return int(tensor.item())
+
+
+def normalize_sequence_parallel_loss(loss_sum: torch.Tensor, good_tokens: torch.Tensor, sp_group) -> torch.Tensor:
+    local_good_tokens = good_tokens.to(device=loss_sum.device, dtype=loss_sum.dtype)
+    local_loss = loss_sum / local_good_tokens.clamp_min(1)
+    if sp_group is None or not dist.is_available() or not dist.is_initialized():
+        return local_loss
+    try:
+        sp_world_size = dist.get_world_size(group=sp_group)
+    except Exception:
+        return local_loss
+    if sp_world_size <= 1:
+        return local_loss
+
+    losses_per_rank = dist_nn.all_gather(local_loss, group=sp_group)
+    tokens_per_rank = dist_nn.all_gather(local_good_tokens, group=sp_group)
+    total_loss = loss_sum.new_zeros(())
+    total_good_tokens = loss_sum.new_zeros(())
+    for rank in range(sp_world_size):
+        rank_tokens = tokens_per_rank[rank]
+        total_good_tokens = total_good_tokens + rank_tokens
+        if rank_tokens.item() > 0:
+            total_loss = total_loss + losses_per_rank[rank] * rank_tokens
+    return total_loss / total_good_tokens.clamp_min(1)
 
 
 def build_parallelism_config(config: dict[str, Any]):
@@ -198,6 +268,9 @@ def validate_training_config(config: dict[str, Any], model) -> None:
         raise ValueError(f"num_attention_heads={num_heads} must be divisible by sp_size={sp_size}.")
     if num_kv_heads and num_kv_heads % sp_size != 0:
         raise ValueError(f"num_key_value_heads={num_kv_heads} must be divisible by sp_size={sp_size}.")
+    pad_to_multiple_of = int(config.get("data", {}).get("pad_to_multiple_of", 1))
+    if sp_size > 1 and pad_to_multiple_of % sp_size != 0:
+        raise ValueError(f"pad_to_multiple_of={pad_to_multiple_of} must be divisible by sp_size={sp_size}.")
 
 
 def main() -> None:
