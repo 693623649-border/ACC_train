@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +12,10 @@ from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 
-def torch_dtype_from_name(name: str) -> torch.dtype:
+def torch_dtype_from_name(name: str) -> torch.dtype | str:
     normalized = str(name).lower()
+    if normalized == "auto":
+        return "auto"
     if normalized in {"bf16", "bfloat16", "torch.bfloat16"}:
         return torch.bfloat16
     if normalized in {"fp16", "float16", "torch.float16"}:
@@ -24,32 +28,64 @@ def torch_dtype_from_name(name: str) -> torch.dtype:
 def cuda_supports_qwen_fp8() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, minor = torch.cuda.get_device_capability(0)
-    return (major, minor) > (8, 9)
+    return all_visible_gpus_support_qwen_fp8()
+
+
+def all_visible_gpus_support_qwen_fp8() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    for index in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(index)
+        if (major, minor) <= (8, 9):
+            return False
+    return True
 
 
 def assert_supported_model_choice(model_name_or_path: str, allow_unsupported_fp8: bool = False) -> None:
     if "FP8" not in model_name_or_path.upper():
         return
-    if cuda_supports_qwen_fp8() or allow_unsupported_fp8:
+    if all_visible_gpus_support_qwen_fp8() or allow_unsupported_fp8:
         return
-    capability = "no CUDA"
+    capability = "no CUDA devices"
     if torch.cuda.is_available():
-        capability = ".".join(map(str, torch.cuda.get_device_capability(0)))
+        capability = ", ".join(
+            f"cuda:{index} sm{major}{minor}"
+            for index in range(torch.cuda.device_count())
+            for major, minor in [torch.cuda.get_device_capability(index)]
+        )
     raise RuntimeError(
-        "The selected Qwen FP8 checkpoint is not the default A800 training path. "
+        "The selected Qwen FP8 checkpoint requires Hopper/Ada-or-newer FP8-capable GPUs. "
         "Qwen documents FP8 computation for GPUs with compute capability > 8.9; "
-        f"this runtime reports {capability}. Use Qwen/Qwen3-30B-A3B-Thinking-2507 "
-        "for the A800 BF16 path, or pass allow_unsupported_fp8=true only for a "
-        "smoke test on supported hardware."
+        f"this runtime reports {capability}. The H20 FP8 path should report sm90-class "
+        "devices. Set allow_unsupported_fp8=true only for an intentional diagnostic run."
     )
+
+
+def build_hf_deepspeed_config(config: dict[str, Any]):
+    ds_path = config.get("training", {}).get("deepspeed_config")
+    if not ds_path:
+        return None
+    try:
+        from transformers.integrations import HfDeepSpeedConfig
+    except ImportError:
+        try:
+            from transformers.deepspeed import HfDeepSpeedConfig
+        except ImportError as exc:
+            raise RuntimeError("ZeRO-3 init-time partitioning requires HfDeepSpeedConfig.") from exc
+
+    with Path(ds_path).open("r", encoding="utf-8") as handle:
+        ds_config = json.load(handle)
+    if ds_config.get("zero_optimization", {}).get("stage") != 3:
+        return None
+    return HfDeepSpeedConfig(ds_config)
 
 
 def load_causal_lm(config: dict[str, Any]):
     model_cfg = config["model"]
     model_name = model_cfg["name_or_path"]
     assert_supported_model_choice(model_name, bool(model_cfg.get("allow_unsupported_fp8", False)))
-    dtype = torch_dtype_from_name(model_cfg.get("torch_dtype", "bfloat16"))
+    dtype = torch_dtype_from_name(model_cfg.get("torch_dtype", "auto"))
+    hf_deepspeed_config = build_hf_deepspeed_config(config)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
@@ -57,6 +93,8 @@ def load_causal_lm(config: dict[str, Any]):
         trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
         device_map=None,
     )
+    if hf_deepspeed_config is not None:
+        model._hf_deepspeed_config = hf_deepspeed_config
     model.config.use_cache = bool(model_cfg.get("use_cache", False))
     if bool(model_cfg.get("gradient_checkpointing", True)):
         model.gradient_checkpointing_enable()
@@ -64,6 +102,9 @@ def load_causal_lm(config: dict[str, Any]):
 
 
 def apply_lora_and_router_policy(model, config: dict[str, Any]):
+    for param in model.parameters():
+        param.requires_grad = False
+
     lora_cfg = config.get("lora", {})
     if lora_cfg.get("enabled", True):
         peft_config = LoraConfig(
@@ -75,15 +116,18 @@ def apply_lora_and_router_policy(model, config: dict[str, Any]):
             bias=str(lora_cfg.get("bias", "none")),
         )
         model = get_peft_model(model, peft_config)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     router_cfg = config.get("router", {})
     if router_cfg.get("train_router_gates", True):
         pattern = re.compile(str(router_cfg.get("name_regex", r"model\.layers\.\d+\.mlp\.gate")))
-        router_dtype = torch_dtype_from_name(router_cfg.get("dtype", "bfloat16"))
+        router_dtype = torch_dtype_from_name(router_cfg.get("dtype", "auto"))
         marked = 0
         for name, module in model.named_modules():
             if pattern.search(name):
-                module.to(dtype=router_dtype)
+                if router_dtype != "auto":
+                    module.to(dtype=router_dtype)
                 for param in module.parameters(recurse=False):
                     param.requires_grad = True
                     marked += param.numel()
@@ -102,15 +146,36 @@ def count_trainable_parameters(model) -> tuple[int, int]:
     return trainable, total
 
 
-def save_router_gates(model, output_dir: str | Path) -> Path:
+def is_main_process() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def gathered_parameter(param: torch.nn.Parameter):
+    try:
+        import deepspeed
+    except ImportError:
+        return nullcontext(param)
+    zero = getattr(deepspeed, "zero", None)
+    if zero is None or not hasattr(zero, "GatheredParameters"):
+        return nullcontext(param)
+    return zero.GatheredParameters([param], modifier_rank=0)
+
+
+def save_router_gates(model, output_dir: str | Path) -> Path | None:
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     router_state = {}
-    for name, tensor in model.state_dict().items():
+    for name, param in model.named_parameters():
         if re.search(r"model\.layers\.\d+\.mlp\.gate", name):
-            router_state[name] = tensor.detach().cpu()
+            with gathered_parameter(param):
+                if is_main_process():
+                    router_state[name] = param.detach().cpu().clone()
+    if not is_main_process():
+        return None
     if not router_state:
         raise RuntimeError("No router gate tensors found while saving router weights.")
+    output.mkdir(parents=True, exist_ok=True)
     path = output / "router_gates.safetensors"
     save_file(router_state, str(path))
     return path

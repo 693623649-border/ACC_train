@@ -41,6 +41,44 @@ class TokenizedJsonlDataset(Dataset):
             raise FileNotFoundError(f"No tokenized files matching {pattern} under {self.tokenized_dir}")
 
         self.records: list[JsonlRecord] = []
+        index_path = self.tokenized_dir / "index.jsonl"
+        if index_path.exists():
+            self._load_index(index_path)
+        else:
+            self._scan_jsonl_files()
+
+        if not self.records:
+            raise ValueError(
+                f"No examples found under {self.tokenized_dir} "
+                f"with min_length={self.min_length} max_length={self.max_length}"
+            )
+        self._handles: dict[Path, Any] = {}
+
+    def _accept_length(self, length: int) -> bool:
+        if self.min_length is not None and length < self.min_length:
+            return False
+        if self.max_length is not None and length > self.max_length:
+            return False
+        return True
+
+    def _load_index(self, index_path: Path) -> None:
+        with index_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                length = int(item["length"])
+                if not self._accept_length(length):
+                    continue
+                self.records.append(
+                    JsonlRecord(
+                        path=self.tokenized_dir / item["relative_path"],
+                        offset=int(item["offset"]),
+                        length=length,
+                    )
+                )
+
+    def _scan_jsonl_files(self) -> None:
         for path in self.files:
             with path.open("rb") as handle:
                 while True:
@@ -55,18 +93,9 @@ class TokenizedJsonlDataset(Dataset):
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"Invalid JSONL at {path}:{offset}") from exc
                     length = int(payload.get("length", len(payload.get("input_ids", []))))
-                    if self.min_length is not None and length < self.min_length:
-                        continue
-                    if self.max_length is not None and length > self.max_length:
+                    if not self._accept_length(length):
                         continue
                     self.records.append(JsonlRecord(path=path, offset=offset, length=length))
-
-        if not self.records:
-            raise ValueError(
-                f"No examples found under {self.tokenized_dir} "
-                f"with min_length={self.min_length} max_length={self.max_length}"
-            )
-        self._handles: dict[Path, Any] = {}
 
     def __len__(self) -> int:
         return len(self.records)

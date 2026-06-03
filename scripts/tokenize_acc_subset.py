@@ -13,10 +13,10 @@ from transformers import AutoTokenizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tokenize ACC subset with assistant-only labels.")
-    parser.add_argument("--manifest", default="paper/ACC_subset_4500_manifest.json")
+    parser.add_argument("--manifest", default="manifests/ACC_subset_4500_manifest.json")
     parser.add_argument("--raw-dir", default="data/acc_subset_4500")
-    parser.add_argument("--output-dir", default="data/tokenized_acc_4500_qwen3_128k")
-    parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B-Thinking-2507")
+    parser.add_argument("--output-dir", default="data/tokenized_acc_4500_qwen3_fp8_128k")
+    parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8")
     parser.add_argument("--max-seq-length", type=int, default=131072)
     parser.add_argument("--pad-to-multiple-of", type=int, default=8)
     parser.add_argument(
@@ -47,7 +47,60 @@ def apply_chat_template(tokenizer, messages: list[dict[str, str]]) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
 
 
+def encode_with_template_assistant_mask(tokenizer, messages: list[dict[str, str]]) -> tuple[list[int], list[int]] | None:
+    try:
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+        )
+    except Exception:
+        return None
+    input_ids = list(encoded["input_ids"])
+    mask = encoded.get("assistant_masks")
+    if mask is None:
+        mask = encoded.get("assistant_tokens_mask")
+    if mask is None:
+        return None
+    labels = [token_id if int(flag) == 1 else -100 for token_id, flag in zip(input_ids, mask)]
+    if all(label == -100 for label in labels):
+        return None
+    return input_ids, labels
+
+
+def encode_with_offset_assistant_labels(tokenizer, messages: list[dict[str, str]]) -> tuple[list[int], list[int]]:
+    full_text = apply_chat_template(tokenizer, messages)
+    encoded = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
+    full_ids = encoded.input_ids
+    labels = [-100] * len(full_ids)
+    cursor = 0
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant" or not message["content"]:
+            continue
+        prefix_text = apply_chat_template(tokenizer, messages[:index] + [{"role": "assistant", "content": ""}])
+        search_from = max(0, min(len(full_text), len(prefix_text), cursor))
+        start_char = full_text.find(message["content"], search_from)
+        if start_char < 0:
+            start_char = full_text.find(message["content"], cursor)
+        if start_char < 0:
+            continue
+        end_char = start_char + len(message["content"])
+        cursor = end_char
+        for token_index, (start, end) in enumerate(encoded.offset_mapping):
+            if start < end_char and end > start_char:
+                labels[token_index] = full_ids[token_index]
+    return full_ids, labels
+
+
 def encode_with_assistant_labels(tokenizer, messages: list[dict[str, str]]) -> tuple[list[int], list[int]]:
+    masked = encode_with_template_assistant_mask(tokenizer, messages)
+    if masked is not None:
+        return masked
+    if tokenizer.is_fast:
+        return encode_with_offset_assistant_labels(tokenizer, messages)
+
     full_text = apply_chat_template(tokenizer, messages)
     full_ids = tokenizer(full_text, add_special_tokens=False).input_ids
     labels = [-100] * len(full_ids)
@@ -96,9 +149,10 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     bucket_handles = {
-        boundary: (output_dir / f"bucket_le_{boundary}.jsonl").open("w", encoding="utf-8")
+        boundary: (output_dir / f"bucket_le_{boundary}.jsonl").open("wb")
         for boundary in boundaries
     }
+    index_handle = (output_dir / "index.jsonl").open("w", encoding="utf-8")
     reject_path = output_dir / "rejected.jsonl"
     reject_handle = reject_path.open("w", encoding="utf-8")
     counts = Counter()
@@ -176,7 +230,24 @@ def main() -> None:
                         "attention_mask": [1] * length,
                         "labels": labels,
                     }
-                    bucket_handles[bucket].write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    bucket_path = output_dir / f"bucket_le_{bucket}.jsonl"
+                    payload_line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+                    offset = bucket_handles[bucket].tell()
+                    bucket_handles[bucket].write(payload_line)
+                    index_handle.write(
+                        json.dumps(
+                            {
+                                "relative_path": bucket_path.name,
+                                "offset": offset,
+                                "length": length,
+                                "id": record.get("id"),
+                                "source": config_name,
+                                "bucket": bucket,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
                     counts[f"accepted_{config_name}"] += 1
                     counts[f"bucket_le_{bucket}"] += 1
                     counts["accepted_total"] += 1
@@ -184,6 +255,7 @@ def main() -> None:
     finally:
         for handle in bucket_handles.values():
             handle.close()
+        index_handle.close()
         reject_handle.close()
 
     metadata = {
