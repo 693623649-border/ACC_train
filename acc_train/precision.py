@@ -97,7 +97,7 @@ def assert_native_fp8_precision(config: dict[str, Any], plan: PrecisionPlan) -> 
         if not _package_available("transformer_engine"):
             raise RuntimeError(
                 "Native FP8 training requires NVIDIA Transformer Engine. "
-                "Install `transformer-engine[pytorch]` in the CUDA13/Torch image."
+                "Install `transformer-engine[pytorch]` through requirements-fp8.txt for the FP8 path."
             )
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 
 try:
     import torch
@@ -14,15 +15,31 @@ def package_available(name: str) -> bool:
 
 
 def main() -> None:
+    print("expected_container_image=2.11.0-cuda12.8-py3.12.3-devel")
+    print("expected_container_image_date=2026-05-12")
+    print("expected_python=3.12")
+    print("expected_torch=2.11")
+    print("expected_torch_cuda=12.8")
+    print("expected_base_model=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8")
+    print("native_fp8_compute_required=false")
     print("required_device_profile=2xA100-SXM4-40GB")
     print("required_mixed_precision=bf16")
     print("required_parallelism=deepspeed_zero3_sp2")
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    python_312 = sys.version_info[:2] == (3, 12)
+    print(f"python_version={python_version}")
+    print(f"python_312={str(python_312).lower()}")
     if torch is None:
         print("torch_available=false")
         print("a100_bf16_training_ready=false")
         return
     print("torch_available=true")
     print(f"torch_version={torch.__version__}")
+    print(f"torch_cuda_version={torch.version.cuda}")
+    torch_211 = str(torch.__version__).startswith("2.11.")
+    torch_cuda_128 = str(torch.version.cuda or "").startswith("12.8")
+    print(f"torch_211={str(torch_211).lower()}")
+    print(f"torch_cuda_128={str(torch_cuda_128).lower()}")
     print(f"accelerate_available={str(package_available('accelerate')).lower()}")
     print(f"deepspeed_available={str(package_available('deepspeed')).lower()}")
     print(f"flash_attn_available={str(package_available('flash_attn')).lower()}")
@@ -64,7 +81,10 @@ def main() -> None:
         and package_available("flash_attn")
     )
     ready = (
-        two_process_target
+        python_312
+        and torch_211
+        and torch_cuda_128
+        and two_process_target
         and all_a100
         and all_ampere_or_newer
         and all_memory_40gb_class

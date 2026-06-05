@@ -2,7 +2,7 @@ project_name: acc-qwen3-a100-bf16-sp2
 seed: 42
 
 model:
-  name_or_path: Qwen/Qwen3-30B-A3B-Thinking-2507
+  name_or_path: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
   precision_mode: native_bf16_ampere
   torch_dtype: bfloat16
   attn_implementation: flash_attention_2
@@ -20,7 +20,7 @@ precision:
 data:
   manifest_path: manifests/ACC_subset_4500_manifest.json
   raw_dir: data/acc_subset_4500
-  tokenized_dir: data/tokenized_acc_4500_qwen3_bf16_128k
+  tokenized_dir: data/tokenized_acc_4500_qwen3_fp8_128k
   min_seq_length: null
   max_seq_length: 131072
   pad_to_multiple_of: 8
@@ -95,4 +95,4 @@ router:
   dtype: auto
 
 assets:
-  non_weight_dir: model_assets/Qwen3-30B-A3B-Thinking-2507-nonweights
+  non_weight_dir: model_assets/Qwen3-30B-A3B-Thinking-2507-FP8-nonweights

@@ -217,7 +217,7 @@ def build_parallelism_config(config: dict[str, Any]):
     except ImportError as exc:
         raise RuntimeError(
             "DeepSpeed-Ulysses SP requires accelerate with ParallelismConfig support. "
-            "Install accelerate>=1.12.0 in the CUDA13/Torch2.7 image."
+            "Install accelerate>=1.12.0 in the CUDA12.8/Torch2.11/Python3.12 image."
         ) from exc
 
     return ParallelismConfig(
