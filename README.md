@@ -7,7 +7,7 @@ Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
 + BF16 training compute on A100 through Accelerate + DeepSpeed
 + frozen Qwen FP8 checkpoint backbone
 + LoRA/router trainable parameters
-+ DeepSpeed ZeRO-3 with optimizer CPU offload
++ DeepSpeed ZeRO-3 without CPU offload by default
 + DeepSpeed-Ulysses SP2
 + container image 2.11.0-cuda12.8-py3.12.3-devel
 + max_seq_length 131072
@@ -15,7 +15,7 @@ Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
 
 训练语义保持为：一条 ACC 样本是一条完整 trajectory sequence，只是在底层由 SP2 沿 sequence 维切到 2 张 A100 上共同训练。不做 packing，不把所有样本强行 pad 到 128K。
 
-> 注意：2xA100 40GB 严格保持 131072 token 属于高显存风险配置。本仓库默认采用保守显存策略（ZeRO-3 + optimizer CPU offload + SP2），但正式训练前仍必须跑 8K 与最长桶 128K smoke test；若 128K smoke OOM，需要调整硬件或显存策略，本配置不会自动降级上下文长度。
+> 注意：2xA100 40GB 严格保持 131072 token 属于高显存风险配置。本仓库默认采用速度优先策略（ZeRO-3 + SP2，不启用 CPU offload），正式训练前必须跑 8K 与最长桶 128K smoke test；若 128K smoke OOM，再考虑增加显存资源、改用更多 sequence parallel 分片，或最后手动启用 CPU offload。本配置不会自动降级上下文长度。
 
 ## 1. 构建环境
 
@@ -194,7 +194,7 @@ warmup_ratio: 0.05
 cross_entropy_chunk_size: 1024
 LoRA: r=8, alpha=16, dropout=0.05, q/k/v/o
 router: model.layers.*.mlp.gate trainable, dtype=auto
-ZeRO-3: optimizer CPU offload, param offload disabled
+ZeRO-3: optimizer/param CPU offload disabled by default
 report_to: wandb
 run_name: acc-qwen3-a100-bf16-sp2
 ```
@@ -221,7 +221,7 @@ bash scripts/launch_train_a100_bf16_sp2.sh \
   --override data.min_seq_length=114689
 ```
 
-如果最长桶 smoke test OOM，先不要启动正式训练；需要增加显存资源、进一步 offload，或显式降低上下文长度。
+如果最长桶 smoke test OOM，先不要启动正式训练；优先增加显存资源或提高 sequence parallel 分片数，最后再手动启用 CPU offload，或显式降低上下文长度。
 
 ## 8. 正式 1 Epoch 训练
 
@@ -256,7 +256,7 @@ outputs/acc_qwen3_a100_bf16_sp2/
 - A100 路径要求 `mixed_precision=bf16`、`bf16=true`、`fp16=false`，并拒绝非 Ampere/BF16-capable GPU。
 - A100 路径使用 `Qwen/Qwen3-30B-A3B-Thinking-2507-FP8` 作为 base model repo，但不启用原生 FP8 compute 或 Transformer Engine FP8 backend。
 - `scripts/launch_train_a100_bf16_sp2.sh` 使用 `accelerate launch --mixed_precision bf16`，不传 FP8 backend。
-- `configs/deepspeed_zero3_bf16_a100_sp2.json` 显式开启 DeepSpeed `bf16`，关闭 `fp16`，使用 ZeRO-3 与 optimizer CPU offload。
+- `configs/deepspeed_zero3_bf16_a100_sp2.json` 显式开启 DeepSpeed `bf16`，关闭 `fp16`，使用 ZeRO-3，默认不启用 optimizer/param CPU offload。
 - `requirements.txt` 是 A100 BF16 默认依赖；旧 H20 FP8 路径如需 Transformer Engine，使用 `requirements-fp8.txt`。
 - backbone 显式冻结，只开启 LoRA 和 router gate；trainable 参数 dtype 默认为 `auto`。
 - loss 使用 SP-aware chunked CE：优先消费 Ulysses 注入的 `shift_labels`，避免 shard 内自行 shift 丢失边界 token。
