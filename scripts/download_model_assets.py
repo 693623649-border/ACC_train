@@ -7,8 +7,8 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 
-DEFAULT_REPO_ID = "Qwen/Qwen3-30B-A3B-Thinking-2507-FP8"
-DEFAULT_OUTPUT_DIR = "model_assets/Qwen3-30B-A3B-Thinking-2507-FP8-nonweights"
+DEFAULT_REPO_ID = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+DEFAULT_OUTPUT_DIR = "model_assets/Qwen3-30B-A3B-Thinking-2507-nonweights"
 
 ALLOW_PATTERNS = [
     "*.json",

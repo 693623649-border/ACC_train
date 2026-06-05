@@ -15,8 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tokenize ACC subset with assistant-only labels.")
     parser.add_argument("--manifest", default="manifests/ACC_subset_4500_manifest.json")
     parser.add_argument("--raw-dir", default="data/acc_subset_4500")
-    parser.add_argument("--output-dir", default="data/tokenized_acc_4500_qwen3_fp8_128k")
-    parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8")
+    parser.add_argument("--output-dir", default="data/tokenized_acc_4500_qwen3_bf16_128k")
+    parser.add_argument("--model-name-or-path", default="Qwen/Qwen3-30B-A3B-Thinking-2507")
     parser.add_argument("--max-seq-length", type=int, default=131072)
     parser.add_argument("--pad-to-multiple-of", type=int, default=8)
     parser.add_argument(

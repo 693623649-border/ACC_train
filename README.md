@@ -1,22 +1,25 @@
-# ACC 4500: 2xH20 FP8 SP2 Long-Context Training
+# ACC 4500: 2xA100 BF16 SP2 Long-Context Training
 
-本仓库用于在 2 张 NVIDIA H20 服务器上训练 ACC 4500 子集。默认训练路径是：
+本仓库用于在单机 2 张 NVIDIA A100-SXM4-40GB 上训练 ACC 4500 子集。默认训练路径是：
 
 ```text
-Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
-+ Native FP8 compute through Accelerate + Transformer Engine
-+ frozen FP8 checkpoint backbone
-+ LoRA/router trainable parameters without BF16 training switches
+Qwen/Qwen3-30B-A3B-Thinking-2507
++ BF16 training on A100 through Accelerate + DeepSpeed
++ frozen BF16 checkpoint backbone
++ LoRA/router trainable parameters
++ DeepSpeed ZeRO-3 with optimizer CPU offload
 + DeepSpeed-Ulysses SP2
 + max_seq_length 131072
 ```
 
-训练语义保持为：一条 ACC 样本是一条完整 trajectory sequence，只是在底层由 SP2 沿 sequence 维切到 2 张 H20 上共同训练。不做 packing，不把所有样本强行 pad 到 128K。
+训练语义保持为：一条 ACC 样本是一条完整 trajectory sequence，只是在底层由 SP2 沿 sequence 维切到 2 张 A100 上共同训练。不做 packing，不把所有样本强行 pad 到 128K。
+
+> 注意：2xA100 40GB 严格保持 131072 token 属于高显存风险配置。本仓库默认采用保守显存策略（ZeRO-3 + optimizer CPU offload + SP2），但正式训练前仍必须跑 8K 与最长桶 128K smoke test；若 128K smoke OOM，需要调整硬件或显存策略，本配置不会自动降级上下文长度。
 
 ## 1. 构建环境
 
 ```bash
-docker build -t acc-qwen3-h20-fp8-sp2 -f docker/Dockerfile .
+docker build -t acc-qwen3-a100-bf16-sp2 -f docker/Dockerfile .
 ```
 
 进入容器：
@@ -26,7 +29,7 @@ docker run --gpus all --ipc=host --network=host --ulimit memlock=-1 --ulimit sta
   -v "$PWD:/workspace/ACC_Train" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -w /workspace/ACC_Train \
-  -it acc-qwen3-h20-fp8-sp2
+  -it acc-qwen3-a100-bf16-sp2
 ```
 
 登录 Hugging Face 和 W&B：
@@ -42,23 +45,24 @@ wandb login
 export WANDB_MODE=offline
 ```
 
-## 2. 检查 H20 原生 FP8 支持
+## 2. 检查 A100 BF16 运行时
 
-Qwen 官方 FP8 checkpoint 要求 GPU compute capability 大于 8.9。当前训练路径还要求 NVIDIA Transformer Engine，因为本仓库使用 Accelerate `mixed_precision=fp8` + TE backend，而不是 BF16 autocast。
+A100 是 Ampere 架构，支持 BF16，但不支持本仓库原 H20 路径所需的原生 FP8 训练。当前默认路径使用 `mixed_precision=bf16`，并通过 DeepSpeed ZeRO-3 做单机双卡分片。
 
 ```bash
-python scripts/check_qwen_fp8_runtime.py
+python scripts/check_a100_bf16_runtime.py
 ```
 
-期望所有可见 GPU 输出：
+期望输出包含：
 
 ```text
-required_mixed_precision=fp8
-required_fp8_backend=te
-transformer_engine_available=true
-qwen_fp8_runtime_supported=true
-all_visible_gpus_qwen_fp8_supported=true
-native_fp8_training_ready=true
+required_device_profile=2xA100-SXM4-40GB
+required_mixed_precision=bf16
+required_parallelism=deepspeed_zero3_sp2
+all_visible_gpus_a100=true
+all_visible_gpus_40gb_class=true
+cuda_bf16_supported=true
+a100_bf16_training_ready=true
 ```
 
 ## 3. 下载模型非权重资产
@@ -72,13 +76,13 @@ python scripts/download_model_assets.py
 默认输出：
 
 ```text
-model_assets/Qwen3-30B-A3B-Thinking-2507-FP8-nonweights
+model_assets/Qwen3-30B-A3B-Thinking-2507-nonweights
 ```
 
 确认没有权重文件：
 
 ```bash
-find model_assets/Qwen3-30B-A3B-Thinking-2507-FP8-nonweights \
+find model_assets/Qwen3-30B-A3B-Thinking-2507-nonweights \
   -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" -o -name "*.gguf" \)
 ```
 
@@ -111,18 +115,18 @@ total: 4500
 python scripts/tokenize_acc_subset.py \
   --manifest manifests/ACC_subset_4500_manifest.json \
   --raw-dir data/acc_subset_4500 \
-  --output-dir data/tokenized_acc_4500_qwen3_fp8_128k \
-  --model-name-or-path Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 \
+  --output-dir data/tokenized_acc_4500_qwen3_bf16_128k \
+  --model-name-or-path Qwen/Qwen3-30B-A3B-Thinking-2507 \
   --max-seq-length 131072
 ```
 
 产物：
 
 ```text
-data/tokenized_acc_4500_qwen3_fp8_128k/bucket_le_*.jsonl
-data/tokenized_acc_4500_qwen3_fp8_128k/index.jsonl
-data/tokenized_acc_4500_qwen3_fp8_128k/metadata.json
-data/tokenized_acc_4500_qwen3_fp8_128k/rejected.jsonl
+data/tokenized_acc_4500_qwen3_bf16_128k/bucket_le_*.jsonl
+data/tokenized_acc_4500_qwen3_bf16_128k/index.jsonl
+data/tokenized_acc_4500_qwen3_bf16_128k/metadata.json
+data/tokenized_acc_4500_qwen3_bf16_128k/rejected.jsonl
 ```
 
 `index.jsonl` 用于训练时快速读取 offset/length，避免初始化时解析巨大 token 数组。
@@ -132,21 +136,19 @@ data/tokenized_acc_4500_qwen3_fp8_128k/rejected.jsonl
 主配置：
 
 ```text
-configs/acc_qwen3_h20_fp8_sp2.yaml
-configs/deepspeed_zero3_fp8_sp2.json
-configs/accelerate_h20_fp8_te.yaml
+configs/acc_qwen3_a100_bf16_sp2.yaml
+configs/deepspeed_zero3_bf16_a100_sp2.json
+configs/accelerate_a100_bf16_ds.yaml
 ```
 
 关键参数：
 
 ```text
-model: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
-precision_mode: native_fp8_transformer_engine
-mixed_precision: fp8
-fp8_backend: TE
-fp8_format: HYBRID
-TrainingArguments bf16/fp16: false/false
-DeepSpeed bf16/fp16: false/false
+model: Qwen/Qwen3-30B-A3B-Thinking-2507
+precision_mode: native_bf16_ampere
+mixed_precision: bf16
+TrainingArguments bf16/fp16: true/false
+DeepSpeed bf16/fp16: true/false
 max_seq_length: 131072
 num_train_epochs: 1
 global_batch_size: 16
@@ -160,8 +162,9 @@ warmup_ratio: 0.05
 cross_entropy_chunk_size: 1024
 LoRA: r=8, alpha=16, dropout=0.05, q/k/v/o
 router: model.layers.*.mlp.gate trainable, dtype=auto
+ZeRO-3: optimizer CPU offload, param offload disabled
 report_to: wandb
-run_name: acc-qwen3-h20-native-fp8-sp2
+run_name: acc-qwen3-a100-bf16-sp2
 ```
 
 ## 7. Smoke Test
@@ -169,42 +172,44 @@ run_name: acc-qwen3-h20-native-fp8-sp2
 短上下文 2 step：
 
 ```bash
-bash scripts/launch_train_h20_fp8_sp2.sh \
-  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_fp8_128k \
-  --override training.output_dir=outputs/smoke_h20_fp8_8k \
+bash scripts/launch_train_a100_bf16_sp2.sh \
+  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_bf16_128k \
+  --override training.output_dir=outputs/smoke_a100_bf16_8k \
   --override training.max_steps=2 \
   --override data.max_seq_length=8192
 ```
 
-最长桶 2 step：
+最长桶 128K 2 step：
 
 ```bash
-bash scripts/launch_train_h20_fp8_sp2.sh \
-  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_fp8_128k \
-  --override training.output_dir=outputs/smoke_h20_fp8_128k \
+bash scripts/launch_train_a100_bf16_sp2.sh \
+  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_bf16_128k \
+  --override training.output_dir=outputs/smoke_a100_bf16_128k \
   --override training.max_steps=2 \
   --override data.min_seq_length=114689
 ```
 
+如果最长桶 smoke test OOM，先不要启动正式训练；需要增加显存资源、进一步 offload，或显式降低上下文长度。
+
 ## 8. 正式 1 Epoch 训练
 
 ```bash
-bash scripts/launch_train_h20_fp8_sp2.sh \
-  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_fp8_128k \
-  --override training.output_dir=outputs/acc_qwen3_h20_native_fp8_sp2
+bash scripts/launch_train_a100_bf16_sp2.sh \
+  --override data.tokenized_dir=data/tokenized_acc_4500_qwen3_bf16_128k \
+  --override training.output_dir=outputs/acc_qwen3_a100_bf16_sp2
 ```
 
 恢复训练：
 
 ```bash
-bash scripts/launch_train_h20_fp8_sp2.sh \
-  --resume-from-checkpoint outputs/acc_qwen3_h20_native_fp8_sp2/checkpoint-50
+bash scripts/launch_train_a100_bf16_sp2.sh \
+  --resume-from-checkpoint outputs/acc_qwen3_a100_bf16_sp2/checkpoint-50
 ```
 
 输出：
 
 ```text
-outputs/acc_qwen3_h20_native_fp8_sp2/
+outputs/acc_qwen3_a100_bf16_sp2/
   adapter_config.json
   adapter_model.safetensors
   router_gates.safetensors
@@ -215,20 +220,21 @@ outputs/acc_qwen3_h20_native_fp8_sp2/
 
 ## 9. 实现要点
 
-- `acc_train/precision.py` 是精度实现模块：强制 `mixed_precision=fp8`、`fp8_backend=TE`，并拒绝 `bf16=true/fp16=true`。
-- `scripts/launch_train_h20_fp8_sp2.sh` 使用 `accelerate launch --mixed_precision fp8 --fp8_backend te`，不再使用 `--mixed_precision bf16`。
-- `configs/deepspeed_zero3_fp8_sp2.json` 显式关闭 DeepSpeed `bf16` 和 `fp16`，ZeRO-3 只负责分片和优化器状态管理。
-- FP8 checkpoint 会检查所有可见 GPU 的 compute capability，非 FP8-capable GPU 会直接报错。
-- backbone 显式冻结，只开启 LoRA 和 router gate；trainable 参数 dtype 默认为 `auto`，不再强制 cast 到 BF16。
+- `acc_train/precision.py` 支持 `native_bf16_ampere` 和旧的 `native_fp8_transformer_engine` 两条精度路径。
+- A100 路径要求 `mixed_precision=bf16`、`bf16=true`、`fp16=false`，并拒绝非 Ampere/BF16-capable GPU。
+- `scripts/launch_train_a100_bf16_sp2.sh` 使用 `accelerate launch --mixed_precision bf16`，不传 FP8 backend。
+- `configs/deepspeed_zero3_bf16_a100_sp2.json` 显式开启 DeepSpeed `bf16`，关闭 `fp16`，使用 ZeRO-3 与 optimizer CPU offload。
+- backbone 显式冻结，只开启 LoRA 和 router gate；trainable 参数 dtype 默认为 `auto`。
 - loss 使用 SP-aware chunked CE：优先消费 Ulysses 注入的 `shift_labels`，避免 shard 内自行 shift 丢失边界 token。
 - 每个 CE chunk 通过 checkpoint 重算 `lm_head`，避免 autograd 为所有 chunk 保留 logits 激活。
 - 全 -100 label chunk 也会执行 dummy `lm_head`，并把 chunk 次数跨 rank 对齐，降低 ZeRO-3 参数 gather 死锁风险。
 - 跨 SP rank 的 loss 按有效 label token 加权聚合，适配 ACC/SFT 中 prompt token 被标记为 `-100` 的不均匀分布。
 - ZeRO-3 下 router gate 保存只在 main process 执行，并在保存前 gather 分片参数。
-- DeepSpeed-Ulysses SP2 负责长序列 attention 并行。
 
 ## 10. 已知服务器验证风险
 
-- FP8 checkpoint + PEFT LoRA + Transformer Engine 对 Qwen3Moe quantized/linear modules 的兼容性必须通过 smoke test 验证。
+- 2xA100-SXM4-40GB 上的 131072 token 正式训练有 OOM 风险，必须先跑 8K 和最长桶 128K smoke test。
+- Qwen3 MoE BF16 checkpoint + PEFT LoRA + ZeRO-3 + Ulysses SP2 的组合需要在目标服务器验证。
 - DeepSpeed-Ulysses 与 Qwen3Moe 的版本组合依赖较新 `transformers/accelerate/deepspeed`。
-- 本地静态测试不能替代 H20 上的 8K 和 128K smoke test。
+- 本地静态测试不能替代 A100 上的 smoke test。
+- 旧 H20 FP8 配置和脚本仍保留在仓库中，用于需要原 FP8 路径时参考或回退。
