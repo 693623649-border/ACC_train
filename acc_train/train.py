@@ -21,7 +21,7 @@ from acc_train.modeling import (
     load_causal_lm,
     save_router_gates,
 )
-from acc_train.precision import configure_native_fp8_precision, print_precision_plan
+from acc_train.precision import configure_precision, print_precision_plan
 
 
 class ACCBucketTrainer(Trainer):
@@ -217,7 +217,7 @@ def build_parallelism_config(config: dict[str, Any]):
     except ImportError as exc:
         raise RuntimeError(
             "DeepSpeed-Ulysses SP requires accelerate with ParallelismConfig support. "
-            "Install accelerate>=1.12.0 in the CUDA13/Torch2.7 image."
+            "Install accelerate>=1.12.0 in the CUDA12.8/Torch2.11/Python3.12 image."
         ) from exc
 
     return ParallelismConfig(
@@ -233,7 +233,7 @@ def build_parallelism_config(config: dict[str, Any]):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Qwen3 MoE on ACC 4500 with SP2 long-context SFT.")
-    parser.add_argument("--config", default="configs/acc_qwen3_h20_fp8_sp2.yaml")
+    parser.add_argument("--config", default="configs/acc_qwen3_a100_bf16_sp2.yaml")
     parser.add_argument("--override", action="append", default=[], help="Dotted YAML override, e.g. training.max_steps=2")
     parser.add_argument("--resume-from-checkpoint", default=None)
     return parser.parse_args()
@@ -276,7 +276,7 @@ def validate_training_config(config: dict[str, Any], model) -> None:
 def main() -> None:
     args = parse_args()
     config = apply_cli_overrides(load_yaml_config(args.config), args.override)
-    precision_plan = configure_native_fp8_precision(config)
+    precision_plan = configure_precision(config)
     set_seed(int(config.get("seed", 42)))
     print_precision_plan(precision_plan)
 
