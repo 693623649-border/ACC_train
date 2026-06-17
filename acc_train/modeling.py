@@ -41,8 +41,14 @@ def all_visible_gpus_support_qwen_fp8() -> bool:
     return True
 
 
-def assert_supported_model_choice(model_name_or_path: str, allow_unsupported_fp8: bool = False) -> None:
+def assert_supported_model_choice(
+    model_name_or_path: str,
+    allow_unsupported_fp8: bool = False,
+    require_native_fp8_runtime: bool = True,
+) -> None:
     if "FP8" not in model_name_or_path.upper():
+        return
+    if not require_native_fp8_runtime:
         return
     if all_visible_gpus_support_qwen_fp8() or allow_unsupported_fp8:
         return
@@ -59,6 +65,14 @@ def assert_supported_model_choice(model_name_or_path: str, allow_unsupported_fp8
         f"this runtime reports {capability}. The H20 FP8 path should report sm90-class "
         "devices. Set allow_unsupported_fp8=true only for an intentional diagnostic run."
     )
+
+
+def config_requires_native_fp8_runtime(config: dict[str, Any]) -> bool:
+    precision_cfg = config.get("precision", {})
+    training_cfg = config.get("training", {})
+    mode = str(precision_cfg.get("mode", config.get("model", {}).get("precision_mode", ""))).lower()
+    mixed_precision = str(precision_cfg.get("mixed_precision", training_cfg.get("mixed_precision", ""))).lower()
+    return mode == "native_fp8_transformer_engine" or mixed_precision == "fp8"
 
 
 def build_hf_deepspeed_config(config: dict[str, Any]):
@@ -83,7 +97,11 @@ def build_hf_deepspeed_config(config: dict[str, Any]):
 def load_causal_lm(config: dict[str, Any]):
     model_cfg = config["model"]
     model_name = model_cfg["name_or_path"]
-    assert_supported_model_choice(model_name, bool(model_cfg.get("allow_unsupported_fp8", False)))
+    assert_supported_model_choice(
+        model_name,
+        bool(model_cfg.get("allow_unsupported_fp8", False)),
+        require_native_fp8_runtime=config_requires_native_fp8_runtime(config),
+    )
     dtype = torch_dtype_from_name(model_cfg.get("torch_dtype", "auto"))
     hf_deepspeed_config = build_hf_deepspeed_config(config)
     model = AutoModelForCausalLM.from_pretrained(
