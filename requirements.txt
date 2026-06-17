@@ -1,13 +1,46 @@
+# =============================================================================
+# ACC Long-Context Training — BF16 默认依赖（A100 / A800 / Ampere sm80 栈）
+# 对应 configs/acc_qwen3_a100_bf16_sp2.yaml 与 A800 BF16 SP2 训练栈。
+# FP8（H20）路径如需 Transformer Engine，使用 requirements-fp8.txt。
+# 目标镜像：Torch 2.11 / CUDA 12.8 / Python 3.12（见 README）。
+# =============================================================================
+
+# ---- 核心深度学习框架（绑定 CUDA，建议用官方 index 单独安装）------------------
+# A800=sm80 不支持 FP8，使用原生 BF16；torch 需匹配 CUDA 12.8 的 wheel。
+#   pip install torch==2.11.* --index-url https://download.pytorch.org/whl/cu128
+torch>=2.11.0
+
+# ---- 长上下文注意力加速（131K 序列必需）--------------------------------------
+# flash_attention_2 将 attention 显存 O(L^2)->O(L)；需与 Torch 2.11/CUDA 12.8/Py3.12 编译匹配。
+#   pip install flash-attn>=2.8.3 --no-build-isolation
+flash-attn>=2.8.3
+
+# ---- 训练框架与分布式---------------------------------------------------------
+# transformers>=4.55：Qwen3Moe + HfDeepSpeedConfig；train.py/modeling.py 使用。
 transformers>=4.55.0
+# accelerate>=1.12：提供 DeepSpeedSequenceParallelConfig / ParallelismConfig（train.py:216）。
 accelerate>=1.12.0
+# deepspeed>=0.16：ZeRO-3 + Ulysses Sequence Parallel SP2（train.py:148 groups）。
 deepspeed>=0.16.0
+# peft>=0.14：LoRA q/k/v/o 注入 + 冻结 backbone（modeling.py:10）。
 peft>=0.14.0
+
+# ---- 模型/数据加载与权重存储--------------------------------------------------
 datasets>=3.0.0
+# huggingface_hub：snapshot_download 拉取非权重资产（download_model_assets.py）。
 huggingface_hub>=0.26.0
+# hf_transfer：大模型下载加速。
 hf_transfer>=0.1.8
+# safetensors：权重/分片保存（modeling.py:11 save_file）。
 safetensors>=0.4.5
+
+# ---- 编译/算子依赖-----------------------------------------------------------
+# triton：flash-attn 及自定义 kernel 编译依赖。
 triton>=3.3.0
+
+# ---- 数据处理与日志----------------------------------------------------------
 PyYAML>=6.0.2
 tqdm>=4.66.0
 numpy>=1.26.0
+# wandb：training.report_to=wandb 实验跟踪。
 wandb>=0.18.0

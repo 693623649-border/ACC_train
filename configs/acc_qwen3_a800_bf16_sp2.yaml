@@ -1,0 +1,110 @@
+# =============================================================================
+# ACC Long-Context Training — A800 80G · 原生 BF16 · 131K · ZeRO-3 + Ulysses SP2
+# 基座：Qwen3-30B-A3B-Thinking-2507（非 FP8，无需运行时反量化）
+# A800=Ampere sm80，不支持 FP8 → 原生 BF16 + TF32；显存同 A100 80G。
+# 关键防 OOM：ZeRO-3 权重分片（bucket/live 调小）+ grad-ckpt + flash-attn2 + chunked CE。
+# 可训练参数（合理最大化）：LoRA q/k/v/o r=16 + router gate ≈ 26M（见 .omc 计划 §9）。
+# =============================================================================
+project_name: acc-qwen3-a800-bf16-sp2
+seed: 42
+
+model:
+  # 原生 BF16 checkpoint，去掉 -FP8 后缀，precision.py 跳过 FP8 硬件断言
+  name_or_path: Qwen/Qwen3-30B-A3B-Thinking-2507
+  precision_mode: native_bf16_ampere
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2   # 长序列必需：attention O(L^2)->O(L)
+  trust_remote_code: false
+  use_cache: false
+  gradient_checkpointing: true             # 131K 防激活 OOM（use_reentrant=False）
+
+precision:
+  mode: native_bf16_ampere                 # A800 sm80 走 BF16 路径（precision.py:104-120）
+  mixed_precision: bf16
+  require_transformer_engine: false        # BF16 路径不依赖 Transformer Engine
+  allow_unsupported_bf16: false
+  trainable_parameter_dtype: auto
+
+data:
+  manifest_path: manifests/ACC_subset_4500_manifest.json
+  raw_dir: data/acc_subset_4500
+  # 换原生 BF16 checkpoint 后需重新 tokenize（不同 tokenizer 路径）
+  tokenized_dir: data/tokenized_acc_4500_qwen3_bf16_128k
+  min_seq_length: null
+  max_seq_length: 131072                   # 硬约束 R3：保持 128K，不降低
+  pad_to_multiple_of: 8
+  assistant_only_labels: true
+  keep_think: true
+  no_packing: true
+  bucket_boundaries:
+    - 8192
+    - 16384
+    - 32768
+    - 49152
+    - 65536
+    - 81920
+    - 98304
+    - 114688
+    - 131072
+
+parallelism:
+  backend: deepspeed_ulysses               # DeepSpeed-Ulysses 序列并行
+  sp_backend: deepspeed
+  sp_size: 2                               # SP2：131K 序列切到 2 卡，每卡 64K
+  dp_replicate_size: 1
+  sp_seq_length_is_variable: true          # 变长桶，SP 边界按 batch 内最长对齐
+  sp_attn_implementation: flash_attention_2
+
+training:
+  output_dir: outputs/acc_qwen3_a800_bf16_sp2
+  deepspeed_config: configs/deepspeed_zero3_bf16_a800_sp2.json
+  num_train_epochs: 1
+  max_steps: -1
+  per_device_train_batch_size: 1           # 131K 每卡 batch=1
+  gradient_accumulation_steps: 16          # global batch = 1×16×1(dp)=16（SP 不增 batch）
+  global_batch_size: 16
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  optim: adamw_torch                       # 可训练参数少（26M），无需 8-bit optim
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  cross_entropy_chunk_size: 1024           # SP-aware chunked CE：控 logits 峰值
+  run_name: acc-qwen3-a800-bf16-sp2
+  logging_dir: outputs/acc_qwen3_a800_bf16_sp2/logs
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 3
+  mixed_precision: bf16
+  bf16: true
+  fp16: false
+  tf32: true                               # A800 支持 TF32，matmul 免费加速
+  dataloader_num_workers: 2
+  remove_unused_columns: false
+  report_to: wandb
+
+# 合理最大化档（.omc 计划 §9 档3）：attention 全投影 + router + rank 16 ≈ 26M
+lora:
+  enabled: true
+  r: 16                                    # 8→16：长上下文学习表达力提升
+  alpha: 32                                # 2×r 保持缩放
+  dropout: 0.05
+  target_modules:                          # 论文 Figure 5a-b 注意力重构
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  bias: none
+
+# 论文 Figure 5c-d 专家特化（每层 mlp.gate 解冻）
+router:
+  train_router_gates: true
+  name_regex: 'model\.layers\.\d+\.mlp\.gate'
+  dtype: auto
+
+assets:
+  # 原生 BF16 checkpoint 的非权重资产目录（去掉 -FP8 后缀）
+  non_weight_dir: model_assets/Qwen3-30B-A3B-Thinking-2507-nonweights
